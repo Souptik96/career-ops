@@ -31,7 +31,7 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { getCareerOpsRoot, resolveTrackerPath } from './path-resolver.mjs';
-import { resolveColumns, parseTrackerRow, extractTrackerReportNumbers } from './tracker-parse.mjs';
+import { resolveColumns, parseTrackerRow, extractTrackerReportLinks, extractTrackerReportNumbers } from './tracker-parse.mjs';
 import * as yaml from 'js-yaml';
 import { isMainModule } from './lib/is-main-module.mjs';
 
@@ -458,6 +458,17 @@ advertised_comp: "100k EUR"
 \`\`\`
 `;
 
+const REPORT_FIXTURE_4368_006 = `# Eval: Globex — Engineer
+
+## Machine Summary
+
+\`\`\`yaml
+company: "Globex"
+role: "Engineer"
+advertised_comp: "200k EUR"
+\`\`\`
+`;
+
 function selfTest() {
   const assert = (cond, msg) => {
     if (!cond) { console.error(`SELF-TEST FAIL: ${msg}`); process.exit(1); }
@@ -734,6 +745,68 @@ function selfTest() {
   assert(dupFolded.applications.filter(a => a.advertised).length === 1, 'one posting is never counted as two advertised figures in the fold');
   assert(mapped.sharedReports.length === 0, 'a report linked from exactly one row is not reported as shared');
 
+  // A Report link whose label disagrees with its target names ONE report: the
+  // target, the file the row is actually joined against. Attaching both numbers
+  // put two companies' advertised figures on one row and the fold kept whichever
+  // arrived last (#4368 review).
+  const mislabelRows = [
+    { num: '1', company: 'Acme', role: 'Eng', report: '[5](../reports/006-globex-2026-01-01.md)', notes: '' },
+  ];
+  const mislabelReports = new Map([
+    ['5', reportToObservation(REPORT_FIXTURE_4351_029, '005', '2026-01-01')],
+    ['6', reportToObservation(REPORT_FIXTURE_4368_006, '006', '2026-01-01')],
+  ]);
+  const mislabel = mapTrackerToApps(mislabelRows, mislabelReports);
+  const advOnMislabeled = mislabel.observations.filter(o => o.num === '1' && o.type === 'advertised');
+  assert(advOnMislabeled.length === 1, `a mismatched link attaches one advertised figure, not two; got ${advOnMislabeled.length}`);
+  assert(advOnMislabeled[0].parsed.mid === 200000, `the link target's figure is the one joined, got ${advOnMislabeled[0].parsed.mid}`);
+  assert(mislabel.mislabeledReports.length === 1 && mislabel.mislabeledReports[0].num === '1'
+    && mislabel.mislabeledReports[0].label === '5' && mislabel.mislabeledReports[0].report === '6',
+    `the conflicting label is reported separately, got ${JSON.stringify(mislabel.mislabeledReports)}`);
+  // The label's report was never linked by this row, so rule 2 still applies to
+  // it — it keeps its own id instead of being swallowed by the mismatched link.
+  assert(mislabel.apps['5']?.company === 'Acme', "the labelled-but-unlinked report keeps its own id");
+  const mislabelFolded = fold(mislabel.observations, mislabel.apps, null);
+  assert(mislabelFolded.applications.find(a => a.num === '1').advertised.value === 200000,
+    'the fold sees only the target report on the mismatched row');
+
+  // A label that agrees with its target, or is absent, is not a mismatch.
+  for (const cell of ['[6](../reports/006-globex-2026-01-01.md)', '[006](../reports/006-globex-2026-01-01.md)',
+    '../reports/006-globex-2026-01-01.md', '[report](../reports/006-globex-2026-01-01.md)']) {
+    const agreed = mapTrackerToApps([{ num: '1', company: 'Acme', role: 'Eng', report: cell, notes: '' }], mislabelReports);
+    assert(agreed.mislabeledReports.length === 0, `"${cell}" is not reported as mislabeled`);
+    assert(agreed.observations.filter(o => o.num === '1' && o.type === 'advertised').length === 1,
+      `"${cell}" attaches exactly one advertised figure to the row`);
+  }
+
+  // The mismatch remediation is per entry, like ambiguousIds: two rows with
+  // different label/target pairs must not be told about one shared pair.
+  const multiMislabel = fold([], { '1': { company: 'X', role: 'R' }, '2': { company: 'Y', role: 'R' } }, null);
+  multiMislabel.quality.ambiguousIds = [];
+  multiMislabel.quality.sharedReports = [];
+  multiMislabel.quality.mislabeledReports = [{ num: '1', label: '5', report: '6' }, { num: '2', label: '8', report: '9' }];
+  const mislabelPrinted = [];
+  const realLogMislabel = console.log;
+  console.log = (...parts) => { mislabelPrinted.push(parts.join(' ')); };
+  try { printSummary(multiMislabel); } finally { console.log = realLogMislabel; }
+  const m1 = mislabelPrinted.find(l => l.includes('#1: label says report 5'));
+  const m2 = mislabelPrinted.find(l => l.includes('#2: label says report 8'));
+  assert(m1 && m1.includes('points at report 6') && !m1.includes('report 9'), `#1's line names its own target, got: ${m1}`);
+  assert(m2 && m2.includes('points at report 9') && !m2.includes('report 6'), `#2's line names its own target, got: ${m2}`);
+
+  // extractTrackerReportLinks keeps label and target apart; the flattened
+  // membership helper it now backs must still answer for BOTH numbers, because
+  // find.mjs and set-status.mjs rely on a collision matching either spelling.
+  const links = extractTrackerReportLinks('[5](../reports/006-globex-2026-01-01.md)');
+  assert(links.length === 1 && links[0].target === 6 && links[0].label === 5,
+    `the link's target and label are both reported, got ${JSON.stringify(links)}`);
+  assert(extractTrackerReportNumbers('[5](../reports/006-globex-2026-01-01.md)').join(',') === '5,6',
+    'the membership helper still returns label and target, in that order');
+  assert(extractTrackerReportLinks('', '[9](../reports/009-acme-2026-01-01.md)')[0]?.target === 9,
+    'an empty Report cell still falls back to a report link in Notes');
+  assert(extractTrackerReportLinks('[report](https://example.com/reports/006-x.md)').length === 0,
+    'an absolute URL is not a local report link');
+
   // The ambiguous-id remediation names each entry's own owner. Two ids owned by
   // two different rows must not both be told to re-point at the first one.
   const multiAmbig = fold([], { '7': { company: 'X', role: 'R' }, '9': { company: 'Y', role: 'R' } }, null);
@@ -791,23 +864,43 @@ const REPORT_FILE_RE = /^(\d{3})-.*-(\d{4}-\d{2}-\d{2})\.md$/;
  *      row) belongs to the first row in tracker order. Only that row receives its
  *      advertised figure, so one posting is never counted as two applications;
  *      every other linking row is named in `quality.sharedReports`.
+ *   5. A Report link whose numeric label disagrees with its target
+ *      (`[5](../reports/006-globex-….md)`) names one report, the target — the
+ *      file this row will actually be joined against. Attaching both numbers
+ *      put two companies' advertised figures on one row, and the fold then kept
+ *      whichever arrived last. The label is reported in
+ *      `quality.mislabeledReports` instead, because it is a tracker typo the
+ *      user should fix, not a second application.
  *
  * @param {object[]} rows - Parsed tracker rows from `parseTrackerRow`.
  * @param {Map<string,object>} reportsByNum - Normalised report# -> `reportToObservation` result.
- * @returns {{apps: object, observations: object[], ambiguousIds: object[], sharedReports: object[]}}
+ * @returns {{apps: object, observations: object[], ambiguousIds: object[], sharedReports: object[], mislabeledReports: object[]}}
  */
 export function mapTrackerToApps(rows, reportsByNum) {
   const apps = {};
   const observations = [];
   const linkedBy = new Map(); // report# -> tracker# that links it FIRST (its owner)
   const alsoLinkedBy = new Map(); // report# -> later tracker#s that link the same report
+  const mislabeled = []; // Report links whose label names a different report than the target
 
   for (const row of rows ?? []) {
     const id = normalizeId(row?.num);
     if (!/^\d+$/.test(id)) continue;
     let company = row.company || null;
     let role = row.role || null;
-    for (const rep of extractTrackerReportNumbers(row.report, row.notes).map(normalizeId)) {
+    const seenReports = new Set();
+    for (const link of extractTrackerReportLinks(row.report, row.notes)) {
+      // Rule 5: the target is the report identity; a disagreeing label is
+      // reported and then dropped, never joined as a second report.
+      const rep = normalizeId(link.target);
+      const label = link.label == null ? null : normalizeId(link.label);
+      if (label !== null && label !== rep
+        && !mislabeled.some(m => m.num === id && m.label === label && m.report === rep)) {
+        mislabeled.push({ num: id, label, report: rep });
+      }
+      // Two links to the same report in one cell are one link's worth of figure.
+      if (seenReports.has(rep)) continue;
+      seenReports.add(rep);
       const report = reportsByNum.get(rep);
       if (!linkedBy.has(rep)) linkedBy.set(rep, id);
       // A report belongs to one application. When a later row links a report an
@@ -852,6 +945,7 @@ export function mapTrackerToApps(rows, reportsByNum) {
     apps, observations,
     ambiguousIds: ambiguousIds.sort((a, b) => compareIds(a.num, b.num)),
     sharedReports,
+    mislabeledReports: mislabeled.sort((a, b) => compareIds(a.num, b.num) || compareIds(a.label, b.label)),
   };
 }
 
@@ -894,6 +988,7 @@ function collectSources() {
   let apps = {};
   let ambiguousIds = [];
   let sharedReports = [];
+  let mislabeledReports = [];
 
   if (rows) {
     const mapped = mapTrackerToApps(rows, reportsByNum);
@@ -901,6 +996,7 @@ function collectSources() {
     observations.push(...mapped.observations);
     ambiguousIds = mapped.ambiguousIds;
     sharedReports = mapped.sharedReports;
+    mislabeledReports = mapped.mislabeledReports;
   } else {
     // No readable tracker: fall back to report filenames, which is what this
     // file did before #4351. An install without applications.md keeps working.
@@ -914,7 +1010,7 @@ function collectSources() {
     observations.push(...parseObservations(readFileSync(OBS_PATH, 'utf-8')));
   }
 
-  return { apps, observations, ambiguousIds, sharedReports };
+  return { apps, observations, ambiguousIds, sharedReports, mislabeledReports };
 }
 
 function loadProfileDesired() {
@@ -1009,6 +1105,15 @@ function printSummary(result) {
       console.log(`      report ${s.report}: counted on #${s.owner}, also linked from ${s.alsoLinkedBy.map(n => `#${n}`).join(', ')}`);
     }
   }
+  if (quality.mislabeledReports?.length) {
+    const n = quality.mislabeledReports.length;
+    console.log(`  ⚠ ${n} Report link${n === 1 ? '' : 's'} name${n === 1 ? 's' : ''} a different report than ${n === 1 ? 'it points' : 'they point'} at (the link target is the report that was joined; the label was not):`);
+    // Per entry, like ambiguousIds: each row's label and target are its own, so
+    // one shared line would name the wrong pair of numbers for every other row.
+    for (const m of quality.mislabeledReports) {
+      console.log(`      #${m.num}: label says report ${m.label}, link points at report ${m.report} — joined report ${m.report}; fix the label or re-point the link`);
+    }
+  }
   if (quality.currencyMismatches.length) {
     console.log(`  ⚠ ${quality.currencyMismatches.length} cross-currency comparison${quality.currencyMismatches.length === 1 ? '' : 's'} skipped (no FX conversion — excluded from all gap math):`);
     for (const m of quality.currencyMismatches) console.log(`      #${m.num} ${m.comparison}: ${m.currencies[0]} vs ${m.currencies[1]}`);
@@ -1041,10 +1146,11 @@ function main() {
     return;
   }
 
-  const { apps, observations, ambiguousIds, sharedReports } = collectSources();
+  const { apps, observations, ambiguousIds, sharedReports, mislabeledReports } = collectSources();
   const result = fold(observations, apps, loadProfileDesired());
   result.quality.ambiguousIds = ambiguousIds ?? [];
   result.quality.sharedReports = sharedReports ?? [];
+  result.quality.mislabeledReports = mislabeledReports ?? [];
 
   if (summaryMode) {
     printSummary(result);
